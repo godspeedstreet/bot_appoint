@@ -6,16 +6,42 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
+# -------------------- Inline fallback config --------------------
+# Если переменные окружения/файл .env недоступны, заполните значения ниже:
+INLINE_BOT_TOKEN = "8207056088:AAEfa_Uw54QEb_OthJMggrYrP5XspL7cUYs"  # вставьте сюда токен бота (строка)
+INLINE_ADMIN_IDS = "372797130, 602156277, 264020227"  # перечислите ID админов через запятую/пробел/точку с запятой, например: "111111, 222222"
+
 # try to load .env if available (optional)
+_env_loaded = False
 try:
 	from dotenv import load_dotenv  # type: ignore
-	load_dotenv()
+	# Load .env from the same directory as this file, not from CWD
+	load_dotenv(dotenv_path=Path(__file__).with_name('.env'))
+	_env_loaded = True
 except Exception:
 	pass
+
+# manual .env fallback (no dependency)
+if not _env_loaded:
+	dotenv_path = Path(__file__).with_name('.env')
+	if dotenv_path.exists():
+		try:
+			for raw_line in dotenv_path.read_text(encoding='utf-8').splitlines():
+				line = raw_line.strip()
+				if not line or line.startswith('#'):
+					continue
+				if '=' not in line:
+					continue
+				key, value = line.split('=', 1)
+				key = key.strip()
+				value = value.strip().strip('"').strip("'")
+				os.environ.setdefault(key, value)
+		except Exception:
+			pass
 
 # -------------------- Config (env) --------------------
 
@@ -26,14 +52,12 @@ class Settings:
 	schedule_path: Path
 
 
-def _parse_admin_ids() -> set[int]:
-	ids_raw = os.getenv("ADMIN_CHAT_IDS")
-	legacy = os.getenv("ADMIN_CHAT_ID")
+def _parse_admin_ids_from_string(ids_raw: str) -> set[int]:
+	import re
 	candidates: list[str] = []
 	if ids_raw and ids_raw.strip():
-		candidates.extend(ids_raw.replace(";", ",").replace("\n", ",").split(","))
-	if legacy and legacy.strip():
-		candidates.append(legacy)
+		parts = re.split(r"[\s,;]+", ids_raw.strip())
+		candidates.extend(parts)
 	result: set[int] = set()
 	for part in candidates:
 		p = part.strip()
@@ -46,8 +70,24 @@ def _parse_admin_ids() -> set[int]:
 	return result
 
 
+def _parse_admin_ids() -> set[int]:
+	ids_env = os.getenv("ADMIN_CHAT_IDS")
+	legacy = os.getenv("ADMIN_CHAT_ID")
+	result: set[int] = set()
+	if ids_env and ids_env.strip():
+		result |= _parse_admin_ids_from_string(ids_env)
+	if legacy and legacy.strip():
+		result |= _parse_admin_ids_from_string(legacy)
+	# always merge inline (not only fallback)
+	if INLINE_ADMIN_IDS.strip():
+		result |= _parse_admin_ids_from_string(INLINE_ADMIN_IDS)
+	return result
+
+
 def load_settings() -> Settings:
 	bot_token = os.getenv("BOT_TOKEN", "").strip()
+	if not bot_token:
+		bot_token = INLINE_BOT_TOKEN.strip()
 	if not bot_token:
 		raise RuntimeError("BOT_TOKEN is not set")
 	admin_chat_ids = _parse_admin_ids()
@@ -63,6 +103,7 @@ class BookingStates(StatesGroup):
 	choose_activity = State()
 	enter_datetime = State()
 	enter_fio = State()
+	enter_phone = State()
 
 
 class AdminStates(StatesGroup):
@@ -74,9 +115,8 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 ACTIVITIES = [
 	"Пилатес",
-	"Стретчинг",
+	"Total body",
 	"Бачата (LadyStyle)",
-	"Фитнес",
 	"Здоровая спина",
 	"Хатха-Йога",
 	"Трансформационная игра",
@@ -84,7 +124,7 @@ ACTIVITIES = [
 	"Женское здоровье",
 	"Инь-Йога",
 	"Оригами  6-10 лет",
-	"Завтрак с Психологом",
+	"Завтрак вМесте",
 ]
 
 
@@ -100,6 +140,19 @@ def activities_keyboard() -> ReplyKeyboardMarkup:
 		rows.append(row)
 	return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
+
+def phone_request_keyboard() -> ReplyKeyboardMarkup:
+	return ReplyKeyboardMarkup(
+		keyboard=[[KeyboardButton(text="Поделиться контактом", request_contact=True)]],
+		resize_keyboard=True,
+	)
+
+
+def book_more_keyboard() -> InlineKeyboardMarkup:
+	return InlineKeyboardMarkup(
+		inline_keyboard=[[InlineKeyboardButton(text="Записаться ещё на одно занятие", callback_data="book_more")]]
+	)
+
 # -------------------- Helpers --------------------
 
 def is_admin(user_id: int) -> bool:
@@ -114,21 +167,46 @@ async def send_schedule_if_exists(message: Message, schedule_path: Path) -> None
 
 def is_valid_fio(text: str) -> bool:
 	parts = [p for p in text.replace("\u00A0", " ").strip().split() if p]
-	if len(parts) < 3:
+	# Require exactly first and last name (at least two parts)
+	if len(parts) < 2:
 		return False
-	for part in parts[:3]:
+	# validate first two words minimal length
+	for part in parts[:2]:
 		if len(part) < 2:
 			return False
 	return True
 
 
-def format_admin_message(activity: str, when_text: str, fio: str, username: Optional[str]) -> str:
+def normalize_phone(text: str) -> str:
+	# Keep leading +, strip other non-digits
+	numbers = []
+	plus_kept = False
+	for idx, ch in enumerate(text.strip()):
+		if ch.isdigit():
+			numbers.append(ch)
+		elif ch == "+" and idx == 0 and not plus_kept:
+			plus_kept = True
+			numbers.append("+")
+	return "".join(numbers)
+
+
+def is_valid_phone(text: str) -> bool:
+	p = normalize_phone(text)
+	# Basic: at least 10 digits (with optional leading +)
+	if p.startswith("+"):
+		return sum(c.isdigit() for c in p) >= 10
+	return p.isdigit() and len(p) >= 10
+
+
+def format_admin_message(activity: str, when_text: str, fio: str, username: Optional[str], phone: str) -> str:
 	username_display = f"@{username}" if username else "-"
+	phone_display = phone if phone else "-"
 	return (
 		"Новая запись:\n"
 		f"Занятие: {activity}\n"
 		f"Дата и время: {when_text}\n"
-		f"ФИО и username: {fio}, {username_display}."
+		f"ФИО и username: {fio}, {username_display}.\n"
+		f"Телефон: {phone_display}"
 	)
 
 # -------------------- Handlers --------------------
@@ -160,7 +238,7 @@ async def on_datetime_entered(message: Message, state: FSMContext) -> None:
 		return
 	when_text = message.text.strip()
 	await state.update_data(when=when_text)
-	await message.answer("Введите ваше ФИО:")
+	await message.answer("Введите имя и фамилию:")
 	await state.set_state(BookingStates.enter_fio)
 
 
@@ -169,14 +247,32 @@ async def on_fio_entered(message: Message, state: FSMContext) -> None:
 		return
 	fio = message.text.strip()
 	if not is_valid_fio(fio):
-		await message.answer("Пожалуйста, введите полное ФИО (например: Иванов Иван Иванович).")
+		await message.answer("Пожалуйста, введите имя и фамилию (два слова).")
+		return
+	await state.update_data(fio=fio)
+	await message.answer("Отправьте номер телефона или поделитесь контактом кнопкой ниже:", reply_markup=phone_request_keyboard())
+	await state.set_state(BookingStates.enter_phone)
+
+
+async def on_phone_entered(message: Message, state: FSMContext) -> None:
+	# allow admin commands to pass through
+	if message.text and message.text.startswith("/"):
+		return
+	phone: str = ""
+	if getattr(message, "contact", None) and message.contact and message.contact.phone_number:
+		phone = normalize_phone(message.contact.phone_number)
+	elif message.text:
+		phone = normalize_phone(message.text)
+	if not is_valid_phone(phone):
+		await message.answer("Пожалуйста, отправьте корректный номер телефона (можно ввести текстом или нажать кнопку).", reply_markup=phone_request_keyboard())
 		return
 	settings = load_settings()
 	data = await state.get_data()
 	activity = data.get("activity", "")
 	when_text = data.get("when", "")
-	admin_text = format_admin_message(activity, when_text, fio, message.from_user.username)
-	await message.answer("Спасибо! Ваша заявка отправлена администратору.")
+	fio = data.get("fio", "")
+	admin_text = format_admin_message(activity, when_text, fio, message.from_user.username, phone)
+	await message.answer("Спасибо, Вы записаны! С вами свяжется администратор, если этого не произошло в течение 8 часов, то напишите нам -> @arusyak_faitaroni .", reply_markup=book_more_keyboard())
 	for admin_id in settings.admin_chat_ids:
 		await message.bot.send_message(chat_id=admin_id, text=admin_text)
 	await state.clear()
@@ -206,6 +302,13 @@ async def on_admin_photo(message: Message, state: FSMContext) -> None:
 	await state.clear()
 
 
+async def on_book_more(callback: CallbackQuery, state: FSMContext) -> None:
+	# restart booking flow
+	await callback.message.answer("Выберите занятие:", reply_markup=activities_keyboard())
+	await state.set_state(BookingStates.choose_activity)
+	await callback.answer()
+
+
 def register_handlers(dp: Dispatcher) -> None:
 	# приоритет админ-команд
 	dp.message.register(cmd_appoint, Command("appoint"))
@@ -214,8 +317,11 @@ def register_handlers(dp: Dispatcher) -> None:
 	dp.message.register(on_activity_chosen, BookingStates.choose_activity)
 	dp.message.register(on_datetime_entered, BookingStates.enter_datetime)
 	dp.message.register(on_fio_entered, BookingStates.enter_fio)
+	dp.message.register(on_phone_entered, BookingStates.enter_phone)
 	# обработка фото для админа
 	dp.message.register(on_admin_photo, AdminStates.await_schedule_photo, F.photo)
+	# inline callback for booking more
+	dp.callback_query.register(on_book_more, F.data == "book_more")
 
 
 async def main() -> None:
