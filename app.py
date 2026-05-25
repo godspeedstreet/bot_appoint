@@ -110,21 +110,23 @@ class AdminStates(StatesGroup):
 	await_schedule_photo = State()
 
 # -------------------- UI/Keyboards --------------------
+# кнопки 
 
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 ACTIVITIES = [
-	"Пилатес",
-	"Total body",
-	"Бачата (LadyStyle)",
+	"Здоровый завтрак мамы с детьми", 
+	"Английский язык",
+	"Хатха-йога",
+	"МФР + стретч",
+	"Здоровая спина мамы с детьми",
 	"Здоровая спина",
-	"Хатха-Йога",
-	"Трансформационная игра",
-	"АРТ - терапия",
-	"Женское здоровье",
-	"Инь-Йога",
-	"Оригами  6-10 лет",
-	"Завтрак вМесте",
+	"Пилатес",
+	"Пилатес мамы с детьми",
+	"Йога для мам и малышей",
+	"Т-игра",
+	"Реггетон Dance",
+	"Zumba",
 ]
 
 
@@ -272,7 +274,7 @@ async def on_phone_entered(message: Message, state: FSMContext) -> None:
 	when_text = data.get("when", "")
 	fio = data.get("fio", "")
 	admin_text = format_admin_message(activity, when_text, fio, message.from_user.username, phone)
-	await message.answer("Спасибо, Вы записаны! С вами свяжется администратор, если этого не произошло в течение 8 часов, то напишите нам -> @arusyak_faitaroni .", reply_markup=book_more_keyboard())
+	await message.answer("Спасибо, вы успешно записаны на занятие. С вами свяжутся в случае отсутствия мест.", reply_markup=book_more_keyboard()) #последнее сообщение 
 	for admin_id in settings.admin_chat_ids:
 		await message.bot.send_message(chat_id=admin_id, text=admin_text)
 	await state.clear()
